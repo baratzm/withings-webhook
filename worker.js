@@ -164,6 +164,9 @@ function formatTelegramMessage(userid, results, error = null) {
     if (result.measurementCount > 1) {
       message += `   📊 ${result.measurementCount} measurements averaged\n`;
     }
+    if (result.dropped && result.dropped.length) {
+      message += `   ⚠️ Dropped (no Intervals field): ${result.dropped.join(', ')}\n`;
+    }
     message += `   Status: ${result.status}\n\n`;
   });
 
@@ -525,18 +528,27 @@ export default {
           const sendRes = await sendToIntervals({ date_iso: dayData.date_iso, wellnessData: newFields }, env);
           
           if (sendRes.ok) {
-            logApi("INTERVALS", `✅ Successfully sent to Intervals: ${Object.keys(newFields).join(', ')} for ${date}`, newFields);
-            await saveSuccessfulFields(userid, latestGrpid, newFields, sendRes.status, env);
-            
+            // Only the fields Intervals actually accepted. Drop-unknown-and-retry (see
+            // sendToIntervals) may have removed fields that have no matching custom
+            // wellness field yet, so we never mark those as "sent".
+            const acceptedFields = sendRes.accepted;
+            logApi("INTERVALS", `✅ Successfully sent to Intervals: ${Object.keys(acceptedFields).join(', ') || '(none)'} for ${date}`, acceptedFields);
+            if (sendRes.dropped && sendRes.dropped.length) {
+              log("WARN", `⚠️ Dropped fields with no matching Intervals custom wellness field for ${date}: ${sendRes.dropped.join(', ')}. Create them in Intervals to capture these metrics.`);
+            }
+            // Save only accepted fields so dropped ones are retried once their field exists.
+            await saveSuccessfulFields(userid, latestGrpid, acceptedFields, sendRes.status, env);
+
             // Track successful send for Telegram notification
             results.push({
               date,
-              fields: newFields,
+              fields: acceptedFields,
               averagedFields,
               measurementCount,
-              status: sendRes.status
+              status: sendRes.status,
+              dropped: sendRes.dropped
             });
-            
+
             sent = true;
           } else {
             log("WARN", `❌ Intervals send failed (attempt ${attempts}) for ${date}`, { status: sendRes.status, text: sendRes.text });
@@ -614,27 +626,74 @@ export default {
     }));
   }
   
+  // 🔧 Parse the offending field code out of an Intervals 422 body, e.g.
+  // {"error":"Unrecognized wellness field [WithingsMuscleMass] for athlete i579914"}
+  function parseUnrecognizedField(text) {
+    const m = /Unrecognized wellness field \[([^\]]+)\]/i.exec(text || "");
+    return m ? m[1] : null;
+  }
+
   // 🔧 Send data to Intervals
+  // Hardened: Intervals rejects the WHOLE record with 422 if any single field code is
+  // not defined for the athlete. We strip the named field and retry so every recognised
+  // field still saves. Returns which fields were accepted vs dropped.
   async function sendToIntervals({ date_iso, wellnessData }, env) {
-    const date = date_iso.slice(0,10); // YYYY-MM-DD
+    const date = date_iso.slice(0, 10); // YYYY-MM-DD
     const athleteId = env.INTERVALS_ATHLETE_ID;
     const apiKey = env.INTERVALS_API_KEY;
     const url = `https://intervals.icu/api/v1/athlete/${athleteId}/wellness/${date}`;
-    const intervalsPayload = {};
+    const auth = "Basic " + btoa(`API_KEY:${apiKey}`);
+
+    // Build the payload keyed by Intervals field code, keeping a reverse map so a field
+    // named in a 422 can be dropped (and reported) by that code.
+    const payload = {};
+    const codeToFieldName = {};
     for (const [fieldName, value] of Object.entries(wellnessData)) {
       const config = FIELD_MAPPING[fieldName];
-      if (config) intervalsPayload[config.intervalsField] = value;
+      if (config) {
+        payload[config.intervalsField] = value;
+        codeToFieldName[config.intervalsField] = fieldName;
+      }
     }
-  
-    const resp = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + btoa(`API_KEY:${apiKey}`)
-      },
-      body: JSON.stringify(intervalsPayload)
-    });
-  
-    const text = await resp.text();
-    return { ok: resp.ok, status: resp.status, text };
+
+    const dropped = []; // field names removed because Intervals doesn't recognise them
+    let resp = null;
+    let text = "";
+    let guard = Object.keys(payload).length + 1; // each failed pass removes >= 1 field
+
+    while (guard-- > 0) {
+      if (Object.keys(payload).length === 0) {
+        return { ok: false, status: 422, text: "All fields unrecognised by Intervals", accepted: {}, dropped };
+      }
+
+      resp = await fetch(url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Authorization": auth },
+        body: JSON.stringify(payload)
+      });
+      text = await resp.text();
+
+      if (resp.ok) break;
+
+      // Drop the unrecognised field named in a 422 and retry; otherwise stop.
+      const unknownCode = resp.status === 422 ? parseUnrecognizedField(text) : null;
+      if (unknownCode && unknownCode in payload) {
+        delete payload[unknownCode];
+        dropped.push(codeToFieldName[unknownCode] || unknownCode);
+        logApi("INTERVALS", `⚠️ Intervals rejected unrecognised field '${unknownCode}' for ${date}; dropping and retrying`, null, "WARN");
+        continue;
+      }
+      break;
+    }
+
+    // Map the surviving payload back to wellnessData field names for the caller.
+    const accepted = {};
+    if (resp && resp.ok) {
+      for (const code of Object.keys(payload)) {
+        const fieldName = codeToFieldName[code];
+        if (fieldName) accepted[fieldName] = wellnessData[fieldName];
+      }
+    }
+
+    return { ok: !!(resp && resp.ok), status: resp ? resp.status : 0, text, accepted, dropped };
   }

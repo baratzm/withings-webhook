@@ -26,6 +26,7 @@ This project implements a **Cloudflare Worker** that receives notifications from
 3.  **Configure environment variables** (see Configuration section below)
 4.  **Deploy the Worker** via Wrangler or Cloudflare UI
 5.  **Setup OAuth tokens** for each user (see Initial Setup section below)
+6.  **Create the custom wellness fields** in Intervals.icu (see [Creating the Custom Wellness Fields](#-creating-the-custom-wellness-fields-in-intervalsicu) below) — required before body-composition metrics will be accepted
 
 🔧 Configuration
 ----------------
@@ -263,6 +264,47 @@ The Worker supports the following Withings measurements:
 | Metabolic Age | 227 | WithingsMetabolicAge | 0 |
 
 > To add new fields, update the `FIELD_MAPPING` object in the code.
+
+🔧 Creating the Custom Wellness Fields in Intervals.icu
+------------------------------------------------------
+
+Intervals.icu has only two **built-in** wellness fields used by this Worker — `weight` and `bodyFat` — which work with no setup. **Every other field in the mapping table above is a _custom wellness field_ that you must create in Intervals.icu _before_ the Worker can send it.** Until the field exists, the Intervals API rejects the request with:
+
+```
+422 Unrecognized wellness field [WithingsMuscleMass] for athlete iXXXXXX
+```
+
+and it rejects the **entire day's record** — so `weight` and `bodyFat` for that day are dropped too, not just the unknown field.
+
+### Where to create them (the step people get wrong)
+
+Custom **wellness** fields are a *different feature* from custom **activity / sport** fields:
+
+- ✅ **Correct** — open a day's **wellness entry dialog** (home / calendar → click the day's wellness entry), then click **“Fields”** → the **“+”** button to add a new field.
+- ❌ **Wrong** — *Settings → Sport Settings → (Ride / Other) → Custom Fields*. Those are **activity** fields; the wellness API never reads them, so using them reproduces the same 422.
+
+### Field configuration
+
+Create one custom wellness field per row below. **The `Code` is the only value that must be exact** — it is case-sensitive and must match the **Intervals Field** value from the mapping table above (the `intervalsField` the Worker sends). The **`Name`** can be any friendly label you like.
+
+| Name | Code (must match exactly) | Type | Unit | Min | Max | Prefix | Format | Suffix | Example | Notes |
+|------|---------------------------|------|------|-----|-----|--------|--------|--------|---------|-------|
+| Muscle Mass | `WithingsMuscleMass` | Numeric | kg | 0 | 100 | — | `.2f` | `kg` | `61.82` | Muscle weight (BIA) |
+| Water Mass | `WithingsWaterMass` | Numeric | kg | 0 | 100 | — | `.2f` | `kg` | `43.06` | Total body water |
+| Bone Mass | `WithingsBoneMass` | Numeric | kg | 0 | 10 | — | `.3f` | `kg` | `3.220` | Dry skeletal mass |
+| Lean Mass | `WithingsLeanMass` | Numeric | kg | 0 | 150 | — | `.2f` | `kg` | `65.06` | Fat-free mass |
+| Visceral Fat | `WithingsVisceralFat` | Numeric | — | 0 | 30 | — | `.1f` | — | `8.0` | Abdominal fat index |
+| BMR | `WithingsBMR` | Numeric | kcal | 0 | 6000 | — | `.0f` | `kcal` | `1750` | Resting calorie burn |
+| Metabolic Age | `WithingsMetabolicAge` | Numeric | years | 0 | 120 | — | `.0f` | `yr` | `35` | BMR vs. age group |
+
+Notes on the columns:
+
+- **Format** uses [d3-format](https://d3js.org/d3-format) notation: `.2f` = 2 decimals, `.3f` = 3 decimals, `.1f` = 1 decimal, `.0f` = integer. Keep it consistent with the **Decimals** column in the mapping table above.
+- `—` means leave that field blank.
+- ⚠️ **The OK button stays greyed out until the `Example` value matches the `Format`.** For example, with format `.2f` the Example must have exactly two decimals (`61.82`). The validation message only appears **after you click into (touch) the Example field** — so if **OK** is disabled and nothing looks wrong, focus the Example field and correct its decimals to match the format.
+- **Only create the fields your scale actually reports.** Most Body / Body+ scales send the first four (muscle, water, bone, lean mass). Visceral Fat, BMR and Metabolic Age (Withings types 170 / 226 / 227) come from higher-end models only — create them only if your scale sends them; otherwise they simply stay empty.
+
+For what each metric means, see Withings’ [body composition & BIA guide](https://support.withings.com/hc/en-us/articles/22480153133841-Body-Smart-Learn-more-about-body-composition-and-bioelectrical-impedance-analysis-BIA).
 
 🔧 Payload Validation
 ---------------------
